@@ -2,16 +2,19 @@ print("DEBUG: script started")
 
 import os
 import re
+import threading
+import traceback
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands, tasks
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# ====== TIMEZONE (Toronto with safe fallback) ======
+# ====== TIMEZONE ======
 
 try:
-    from zoneinfo import ZoneInfo  # Python 3.9+ standard lib
+    from zoneinfo import ZoneInfo
     try:
         TORONTO_TZ = ZoneInfo("America/Toronto")
     except Exception:
@@ -19,12 +22,13 @@ try:
 except Exception:
     TORONTO_TZ = timezone.utc
 
-# ====== CONFIGURATION ======
-# For Render / production, set DISCORD_TOKEN and MONGODB_URI as environment variables.
-# For local testing you can either set env vars or temporarily paste values below.
+# ====== ENVIRONMENT VARIABLES ======
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 MONGODB_URI = os.environ["MONGODB_URI"]
+PORT = int(os.environ.get("PORT", 10000))
+
+# ====== CONFIG ======
 
 WATCHED_CHANNEL_IDS = [
     1439856570061033565,
@@ -32,8 +36,8 @@ WATCHED_CHANNEL_IDS = [
     1477839908562407485,
 ]
 
-LOG_CHANNEL_ID = 1459297868861931715            # per-trade logs + !daily
-WEEKLY_RECAP_CHANNEL_ID = 1507876090956353726   # weekly recaps
+LOG_CHANNEL_ID = 1459297868861931715
+WEEKLY_RECAP_CHANNEL_ID = 1507876090956353726
 
 KEYWORDS = [
     "close", "closed", "closing",
@@ -65,11 +69,32 @@ TP3_TAGS = ["tp3", "tp 3", "third trim", "third tp"]
 DAYTRADE_TAGS = ["daytrade", "day trade", "intraday", "scalp"]
 SWING_TAGS = ["swing", "swing trade"]
 
-daily_trades: list[dict] = []
-weekly_trades: list[dict] = []
-last_weekly_recap_key: str | None = None
+daily_trades = []
+weekly_trades = []
+last_weekly_recap_key = None
 
-# ====== DISCORD & MONGO SETUP ======
+# ====== HTTP HEALTH SERVER FOR RENDER ======
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Bot is running")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Health server running on port {PORT}")
+    server.serve_forever()
+
+# ====== DISCORD & MONGO ======
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -79,6 +104,7 @@ mongo_client = AsyncIOMotorClient(MONGODB_URI)
 db = mongo_client["TradeRecap"]
 trades_col = db["trades"]
 
+# ====== EVENTS ======
 
 @bot.event
 async def on_ready():
@@ -87,7 +113,7 @@ async def on_ready():
     if not weekly_recap_loop.is_running():
         weekly_recap_loop.start()
 
-# ====== HELPER FUNCTIONS ======
+# ====== HELPERS ======
 
 def classify_exit_type(text: str) -> str:
     t = text.lower()
@@ -125,7 +151,6 @@ def classify_exit_type(text: str) -> str:
 
     return " | ".join(parts)
 
-
 def extract_symbol_and_core_line(text: str):
     pattern = re.compile(
         r"([A-Za-z]{2,6}\s+\d{2,5}\w?)\s*@\s*([\d\.]+)(?:\s+(-?\d+(?:\.\d+)?%)(?:\s+(profit|loss))?)?",
@@ -136,7 +161,6 @@ def extract_symbol_and_core_line(text: str):
         symbol = match.group(1).upper()
         return symbol, match.group(0)
     return None, text.strip()
-
 
 def parse_explicit_pct(text: str):
     t = text.lower()
@@ -155,7 +179,6 @@ def parse_explicit_pct(text: str):
         direction = None
 
     return round(pct, 2), direction
-
 
 def parse_entry_exit_pct(text: str):
     t = text.lower()
@@ -178,7 +201,6 @@ def parse_entry_exit_pct(text: str):
     direction = "profit" if pct > 0 else "loss" if pct < 0 else "breakeven"
     return round(pct, 2), direction
 
-
 def infer_result_direction(text: str):
     t = text.lower()
     if any(x in t for x in ["profit", "profits", "win", "winner", "green", "gains", "in the green"]):
@@ -186,7 +208,6 @@ def infer_result_direction(text: str):
     if any(x in t for x in ["loss", "losses", "loser", "red", "small loss", "slight loss", "down"]):
         return "loss"
     return None
-
 
 def build_pnl_text(pct, direction):
     if pct is not None and direction:
@@ -204,14 +225,13 @@ def build_pnl_text(pct, direction):
 
     return "⚪ Result unknown", discord.Color.light_grey()
 
-
 def make_summary_embed(title: str, trades: list[dict], color: discord.Color) -> discord.Embed:
     total_pct = 0.0
     counted = 0
     wins = 0
     losses = 0
     breakevens = 0
-    lines: list[str] = []
+    lines = []
 
     for t in trades:
         pct = t["pct"]
@@ -238,11 +258,7 @@ def make_summary_embed(title: str, trades: list[dict], color: discord.Color) -> 
     embed = discord.Embed(title=title, color=color)
     embed.add_field(name="Net PnL", value=f"{total_pct:+.2f}%", inline=True)
     embed.add_field(name="Average per Trade", value=f"{avg_pct:+.2f}%", inline=True)
-    embed.add_field(
-        name="Winrate",
-        value=f"{winrate:.2f}% ({wins}W / {losses}L, {breakevens} BE)",
-        inline=False,
-    )
+    embed.add_field(name="Winrate", value=f"{winrate:.2f}% ({wins}W / {losses}L, {breakevens} BE)", inline=False)
 
     trade_text = "\n".join(lines) if lines else "_No logged trades in this period._"
     if len(trade_text) > 1024:
@@ -255,22 +271,25 @@ def make_summary_embed(title: str, trades: list[dict], color: discord.Color) -> 
 
 # ====== MESSAGE LISTENER ======
 
-@bot.listen("on_message")
-async def trade_logger(message: discord.Message):
+@bot.event
+async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
     if message.channel.id not in WATCHED_CHANNEL_IDS:
+        await bot.process_commands(message)
         return
 
     content = message.content
     content_lower = content.lower()
 
     if not any(keyword in content_lower for keyword in KEYWORDS):
+        await bot.process_commands(message)
         return
 
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
     if log_channel is None:
+        await bot.process_commands(message)
         return
 
     symbol, core_line = extract_symbol_and_core_line(content)
@@ -334,6 +353,8 @@ async def trade_logger(message: discord.Message):
 
     print(f"Logged trade from {message.author} in #{message.channel.name}")
 
+    await bot.process_commands(message)
+
 # ====== COMMANDS ======
 
 @bot.command(name="daily")
@@ -345,7 +366,6 @@ async def daily_summary(ctx: commands.Context):
     embed = make_summary_embed("📒 Daily PnL Summary", daily_trades, discord.Color.gold())
     await ctx.send(embed=embed)
     daily_trades.clear()
-
 
 @bot.command(name="weekly")
 async def weekly_summary(ctx: commands.Context):
@@ -365,7 +385,6 @@ async def weekly_recap_loop():
 
     now = datetime.now(TORONTO_TZ)
 
-    # Friday = 4, at 20:00 local time
     if now.weekday() == 4 and now.hour == 20 and now.minute == 0:
         recap_key = f"{now.isocalendar().year}-W{now.isocalendar().week}"
 
@@ -382,17 +401,20 @@ async def weekly_recap_loop():
         last_weekly_recap_key = recap_key
         weekly_trades = []
 
-
 @weekly_recap_loop.before_loop
 async def before_weekly_recap_loop():
     await bot.wait_until_ready()
 
-# ====== RUN BOT ======
+# ====== STARTUP ======
+
+threading.Thread(target=run_health_server, daemon=True).start()
 
 print("DEBUG: about to run bot")
 
 try:
     bot.run(TOKEN)
 except Exception as e:
-    print("ERROR starting bot:", e)
-    input("Press Enter to close")
+    print("ERROR starting bot:")
+    print(str(e))
+    traceback.print_exc()
+    raise
