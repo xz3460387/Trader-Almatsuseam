@@ -1,0 +1,4 @@
+discord.py
+motor
+pymongo[srv]==3.12
+tzdata
