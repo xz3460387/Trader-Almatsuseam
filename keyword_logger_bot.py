@@ -6,6 +6,7 @@ import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
@@ -69,9 +70,10 @@ TP3_TAGS = ["tp3", "tp 3", "third trim", "third tp"]
 DAYTRADE_TAGS = ["daytrade", "day trade", "intraday", "scalp"]
 SWING_TAGS = ["swing", "swing trade"]
 
-daily_trades = []      # still used for optional in-memory recap & debugging
-weekly_trades = []     # still used for auto weekly recap loop
+daily_trades = []
+weekly_trades = []
 last_weekly_recap_key = None
+last_monthly_recap_key = None
 
 processed_message_ids = set()
 
@@ -114,6 +116,8 @@ async def on_ready():
     print("------")
     if not weekly_recap_loop.is_running():
         weekly_recap_loop.start()
+    if not monthly_recap_loop.is_running():
+        monthly_recap_loop.start()
 
 # ====== HELPERS ======
 
@@ -227,7 +231,7 @@ def build_pnl_text(pct, direction):
 
     return "⚪ Result unknown", discord.Color.light_grey()
 
-def make_summary_embed(title: str, trades: list[dict], color: discord.Color) -> discord.Embed:
+def make_summary_embed(title: str, trades: List[Dict], color: discord.Color) -> discord.Embed:
     total_pct = 0.0
     counted = 0
     wins = 0
@@ -266,7 +270,6 @@ def make_summary_embed(title: str, trades: list[dict], color: discord.Color) -> 
     if len(trade_text) > 1024:
         trade_text = trade_text[:1000] + "\n…and more"
     embed.add_field(name="Trades", value=trade_text, inline=False)
-
     embed.set_footer(text="PnL recap")
     embed.timestamp = datetime.now(TORONTO_TZ)
     return embed
@@ -278,7 +281,6 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # prevent double-processing of the same Discord message
     if message.id in processed_message_ids:
         await bot.process_commands(message)
         return
@@ -306,7 +308,6 @@ async def on_message(message: discord.Message):
     classification = classify_exit_type(content)
 
     pct, direction = parse_explicit_pct(content)
-
     if pct is None:
         pct, parsed_direction = parse_entry_exit_pct(content)
         if direction is None:
@@ -347,7 +348,6 @@ async def on_message(message: discord.Message):
         "channel": message.channel.name,
     }
 
-    # store in MongoDB with a timestamp (Discord's created_at is UTC-aware)
     await trades_col.insert_one({
         "symbol": trade_data["symbol"],
         "summary": trade_data["summary"],
@@ -356,10 +356,9 @@ async def on_message(message: discord.Message):
         "classification": trade_data["classification"],
         "channel": trade_data["channel"],
         "user_id": message.author.id,
-        "timestamp": message.created_at,
+        "timestamp": message.created_at.astimezone(timezone.utc),
     })
 
-    # optional in-memory tracking (still used for auto weekly loop)
     daily_trades.append(trade_data)
     weekly_trades.append(trade_data)
 
@@ -367,16 +366,21 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# ====== COMMANDS (MONGO-BASED) ======
+# ====== COMMANDS ======
 
 @bot.command(name="daily")
 async def daily_summary(ctx: commands.Context):
     now_local = datetime.now(TORONTO_TZ)
     start_of_day_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day_local = start_of_day_local + timedelta(days=1)
+
     start_of_day_utc = start_of_day_local.astimezone(timezone.utc)
+    end_of_day_utc = end_of_day_local.astimezone(timezone.utc)
 
     trades = []
-    async for doc in trades_col.find({"timestamp": {"$gte": start_of_day_utc}}):
+    async for doc in trades_col.find({
+        "timestamp": {"$gte": start_of_day_utc, "$lt": end_of_day_utc}
+    }):
         trades.append({
             "symbol": doc.get("symbol", "N/A"),
             "summary": doc.get("summary", "N/A"),
@@ -393,22 +397,19 @@ async def daily_summary(ctx: commands.Context):
     embed = make_summary_embed("📒 Daily PnL Summary", trades, discord.Color.gold())
     await ctx.send(embed=embed)
 
-
 @bot.command(name="weekly")
 async def weekly_summary(ctx: commands.Context):
     now_local = datetime.now(TORONTO_TZ)
-    # start of week = Monday 00:00 in Toronto time
-    start_of_week_local = now_local - timedelta(
-        days=now_local.weekday(),
-        hours=now_local.hour,
-        minutes=now_local.minute,
-        seconds=now_local.second,
-        microseconds=now_local.microsecond,
-    )
+    start_of_week_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_local.weekday())
+    end_of_week_local = start_of_week_local + timedelta(days=7)
+
     start_of_week_utc = start_of_week_local.astimezone(timezone.utc)
+    end_of_week_utc = end_of_week_local.astimezone(timezone.utc)
 
     trades = []
-    async for doc in trades_col.find({"timestamp": {"$gte": start_of_week_utc}}):
+    async for doc in trades_col.find({
+        "timestamp": {"$gte": start_of_week_utc, "$lt": end_of_week_utc}
+    }):
         trades.append({
             "symbol": doc.get("symbol", "N/A"),
             "summary": doc.get("summary", "N/A"),
@@ -426,17 +427,73 @@ async def weekly_summary(ctx: commands.Context):
     embed = make_summary_embed("🗓️ Weekly PnL Recap", trades, discord.Color.blue())
     await weekly_channel.send(embed=embed)
 
-# ====== AUTOMATIC WEEKLY RECAP (still uses in-memory list) ======
+@bot.command(name="monthly")
+async def monthly_summary(ctx: commands.Context):
+    now_local = datetime.now(TORONTO_TZ)
+    start_of_month_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    if start_of_month_local.month == 12:
+        next_month_local = start_of_month_local.replace(year=start_of_month_local.year + 1, month=1)
+    else:
+        next_month_local = start_of_month_local.replace(month=start_of_month_local.month + 1)
+
+    start_of_month_utc = start_of_month_local.astimezone(timezone.utc)
+    next_month_utc = next_month_local.astimezone(timezone.utc)
+
+    trades = []
+    async for doc in trades_col.find({
+        "timestamp": {"$gte": start_of_month_utc, "$lt": next_month_utc}
+    }):
+        trades.append({
+            "symbol": doc.get("symbol", "N/A"),
+            "summary": doc.get("summary", "N/A"),
+            "pct": doc.get("pct"),
+            "direction": doc.get("direction"),
+            "classification": doc.get("classification"),
+            "channel": doc.get("channel", "unknown"),
+        })
+
+    if not trades:
+        await ctx.send("No trades logged yet for this month.")
+        return
+
+    title = f"📆 Monthly PnL Recap – {start_of_month_local.strftime('%Y-%m')}"
+    embed = make_summary_embed(title, trades, discord.Color.purple())
+    await ctx.send(embed=embed)
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context):
+    embed = discord.Embed(
+        title="📚 Recap Bot Commands",
+        color=discord.Color.teal(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="Commands",
+        value=(
+            "`!daily` – Daily recap\n"
+            "`!weekly` – Weekly recap\n"
+            "`!monthly` – Month-to-date recap\n"
+            "`!help` – Show this message"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Watched Channels",
+        value="\n".join(f"- <#{cid}>" for cid in WATCHED_CHANNEL_IDS),
+        inline=False,
+    )
+    await ctx.send(embed=embed)
+
+# ====== AUTOMATIC WEEKLY RECAP ======
 
 @tasks.loop(minutes=1)
 async def weekly_recap_loop():
     global last_weekly_recap_key, weekly_trades
 
     now = datetime.now(TORONTO_TZ)
-
     if now.weekday() == 4 and now.hour == 20 and now.minute == 0:
         recap_key = f"{now.isocalendar().year}-W{now.isocalendar().week}"
-
         if recap_key == last_weekly_recap_key:
             return
 
@@ -452,6 +509,66 @@ async def weekly_recap_loop():
 
 @weekly_recap_loop.before_loop
 async def before_weekly_recap_loop():
+    await bot.wait_until_ready()
+
+# ====== AUTOMATIC MONTHLY RECAP ======
+
+@tasks.loop(minutes=5)
+async def monthly_recap_loop():
+    global last_monthly_recap_key
+
+    now_local = datetime.now(TORONTO_TZ)
+    if now_local.day != 1 or now_local.hour != 20:
+        return
+
+    key = f"{now_local.year}-{now_local.month:02d}"
+    if key == last_monthly_recap_key:
+        return
+
+    if now_local.month == 1:
+        prev_year = now_local.year - 1
+        prev_month = 12
+    else:
+        prev_year = now_local.year
+        prev_month = now_local.month - 1
+
+    start_prev_local = datetime(prev_year, prev_month, 1, tzinfo=TORONTO_TZ)
+    if prev_month == 12:
+        start_next_local = datetime(prev_year + 1, 1, 1, tzinfo=TORONTO_TZ)
+    else:
+        start_next_local = datetime(prev_year, prev_month + 1, 1, tzinfo=TORONTO_TZ)
+
+    start_prev_utc = start_prev_local.astimezone(timezone.utc)
+    start_next_utc = start_next_local.astimezone(timezone.utc)
+
+    trades = []
+    async for doc in trades_col.find({
+        "timestamp": {"$gte": start_prev_utc, "$lt": start_next_utc}
+    }):
+        trades.append({
+            "symbol": doc.get("symbol", "N/A"),
+            "summary": doc.get("summary", "N/A"),
+            "pct": doc.get("pct"),
+            "direction": doc.get("direction"),
+            "classification": doc.get("classification"),
+            "channel": doc.get("channel", "unknown"),
+        })
+
+    if not trades:
+        last_monthly_recap_key = key
+        return
+
+    title = f"📆 Automatic Monthly PnL Recap – {start_prev_local.strftime('%Y-%m')}"
+    embed = make_summary_embed(title, trades, discord.Color.purple())
+
+    channel = bot.get_channel(WEEKLY_RECAP_CHANNEL_ID)
+    if channel:
+        await channel.send(embed=embed)
+
+    last_monthly_recap_key = key
+
+@monthly_recap_loop.before_loop
+async def before_monthly_recap_loop():
     await bot.wait_until_ready()
 
 # ====== STARTUP ======
