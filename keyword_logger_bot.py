@@ -1272,7 +1272,7 @@ async def helpbot(ctx: commands.Context):
         value="`!debugon` / `!debugoff` – Show why messages were ignored in watched channels.",
         inline=False,
     )
-    embed.set_footer(text="Watched channels: " + ", ".join(f\"{cid}\" for cid in WATCHED_CHANNEL_IDS))
+    embed.set_footer(text="Watched channels: " + ", ".join(str(cid) for cid in WATCHED_CHANNEL_IDS))
     await ctx.send(embed=embed)
 
 
