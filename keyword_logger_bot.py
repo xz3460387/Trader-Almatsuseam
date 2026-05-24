@@ -14,12 +14,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-import os
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-
-logger.warning(f"MONGO_URI raw env: {repr(os.environ.get('MONGO_URI'))}")
 
 DB_NAME = os.getenv("MONGO_DB_NAME", "TradeRecap")
 TRADES_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "trades")
@@ -1278,7 +1272,7 @@ async def helpbot(ctx: commands.Context):
         value="`!debugon` / `!debugoff` – Show why messages were ignored in watched channels.",
         inline=False,
     )
-    embed.set_footer(text="Watched channels: " + ", ".join(f"#{cid}" for cid in WATCHED_CHANNEL_IDS))
+    embed.set_footer(text="Watched channels: " + ", ".join(f\"{cid}\" for cid in WATCHED_CHANNEL_IDS))
     await ctx.send(embed=embed)
 
 
