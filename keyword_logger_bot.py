@@ -38,7 +38,9 @@ WATCHED_CHANNEL_IDS = [
 ]
 
 LOG_CHANNEL_ID = 1459297868861931715
-WEEKLY_RECAP_CHANNEL_ID = 1507876090956353726
+
+# NEW: weekly manual + automatic recaps go here
+WEEKLY_RECAP_CHANNEL_ID = 1507958570640216245
 
 KEYWORDS = [
     "close", "closed", "closing",
@@ -57,9 +59,10 @@ KEYWORDS = [
     "tp hit", "tp1 hit", "tp2 hit", "tp3 hit",
     "first trim", "second trim", "third trim",
     "profit", "profits", "winner", "win", "wins",
-    "green", "green day", "gains", "in the green",
+    "green", "green day", "gains", "gain", "gaining", "in the green",
     "loss", "losses", "loser", "red", "red day",
     "down", "small loss", "slight loss",
+    "up", "ripped", "pumped", "mooning", "spike",
 ]
 
 PARTIAL_TAGS = ["(partial)", "[partial]", "partial", "trim", "trimmed", "trimming", "haircut"]
@@ -70,8 +73,8 @@ TP3_TAGS = ["tp3", "tp 3", "third trim", "third tp"]
 DAYTRADE_TAGS = ["daytrade", "day trade", "intraday", "scalp"]
 SWING_TAGS = ["swing", "swing trade"]
 
-daily_trades: List[Dict] = []   # in-memory for debugging if you want
-weekly_trades: List[Dict] = []  # used by auto weekly recap
+daily_trades: List[Dict] = []
+weekly_trades: List[Dict] = []
 last_weekly_recap_key = None
 
 processed_message_ids = set()
@@ -155,7 +158,6 @@ def classify_exit_type(text: str) -> str:
     return " | ".join(parts)
 
 def extract_symbol_and_core_line(text: str):
-    # e.g. "TSLA 260C @ 1.23 +20% profit"
     pattern = re.compile(
         r"([A-Za-z]{2,6}\s+\d{2,5}\w?)\s*@\s*([\d\.]+)(?:\s+(-?\d+(?:\.\d+)?%)(?:\s+(profit|loss))?)?",
         re.IGNORECASE,
@@ -177,7 +179,7 @@ def parse_explicit_pct(text: str):
         direction = "loss"
         if pct > 0:
             pct = -pct
-    elif "profit" in t or "win" in t or "green" in t or "gains" in t:
+    elif any(x in t for x in ["profit", "win", "green", "gains", "gain", "gaining", "up", "ripped", "pumped"]):
         direction = "profit"
     else:
         direction = None
@@ -207,7 +209,7 @@ def parse_entry_exit_pct(text: str):
 
 def infer_result_direction(text: str):
     t = text.lower()
-    if any(x in t for x in ["profit", "profits", "win", "winner", "green", "gains", "in the green"]):
+    if any(x in t for x in ["profit", "profits", "win", "winner", "green", "gains", "gain", "gaining", "in the green", "up", "ripped", "pumped", "mooning"]):
         return "profit"
     if any(x in t for x in ["loss", "losses", "loser", "red", "small loss", "slight loss", "down"]):
         return "loss"
@@ -420,14 +422,54 @@ async def weekly_summary(ctx: commands.Context):
             "direction": doc.get("direction"),
             "classification": doc.get("classification"),
             "channel": doc.get("channel", "unknown"),
+            "timestamp": doc.get("timestamp"),
         })
 
     if not trades:
         await ctx.send("No trades logged yet for this week.")
         return
 
+    # Base summary (winrate, net PnL, etc.)
+    title = f"🗓️ Weekly PnL Recap – {start_of_week_local.date()} → {end_of_week_local.date() - timedelta(days=1)}"
+    embed = make_summary_embed(title, trades, discord.Color.blue())
+
+    # Extra weekly stats: total PnL per day and average daily PnL
+    day_pnls: Dict[str, float] = {}
+    total_pnl = 0.0
+
+    for t in trades:
+        pct = t.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        total_pnl += pct
+
+        ts = t.get("timestamp")
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts_local = ts.replace(tzinfo=timezone.utc).astimezone(TORONTO_TZ)
+            else:
+                ts_local = ts.astimezone(TORONTO_TZ)
+        else:
+            ts_local = datetime.now(TORONTO_TZ)
+
+        date_key = ts_local.date().isoformat()
+        day_pnls[date_key] = day_pnls.get(date_key, 0.0) + pct
+
+    if day_pnls:
+        avg_daily_pnl = total_pnl / len(day_pnls)
+        day_lines = [f"{day}: {pnl:+.2f}%" for day, pnl in sorted(day_pnls.items())]
+        embed.add_field(
+            name="Daily PnL",
+            value="\n".join(day_lines),
+            inline=False,
+        )
+        embed.add_field(
+            name="Average Daily PnL",
+            value=f"{avg_daily_pnl:+.2f}%",
+            inline=True,
+        )
+
     weekly_channel = bot.get_channel(WEEKLY_RECAP_CHANNEL_ID) or ctx.channel
-    embed = make_summary_embed("🗓️ Weekly PnL Recap", trades, discord.Color.blue())
     await weekly_channel.send(embed=embed)
 
 # ====== AUTOMATIC WEEKLY RECAP ======
