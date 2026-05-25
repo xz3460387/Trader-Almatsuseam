@@ -12,8 +12,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # FILL THESE IN BEFORE RUNNING
 # ============================================================
 
-DISCORD_TOKEN = ""
-MONGO_URI = ""
+DISCORD_TOKEN = "PASTE_YOUR_DISCORD_BOT_TOKEN_HERE"
+MONGO_URI = "PASTE_YOUR_MONGODB_URI_HERE"
 
 DB_NAME = "TradeRecap"
 TRADES_COLLECTION_NAME = "trades"
@@ -29,6 +29,7 @@ DAILY_RECAP_CHANNEL_ID = 1459297868861931715
 WEEKLY_RECAP_CHANNEL_ID = 1507958570640216245
 LONG_TERM_STATS_CHANNEL_ID = 1508577446700777674
 ANALYTICS_CHANNEL_ID = 1508577544075612220
+CLEANUP_CHECK_CHANNEL_ID = 1508602677393887262
 
 COMMAND_PREFIX = "!"
 
@@ -40,11 +41,8 @@ MAX_DB_SIZE_MB = 512
 AUTO_CLEANUP_ENABLED = True
 AUTO_CLEANUP_INTERVAL_HOURS = 12
 
-# Conservative document count guardrails to stay well below 512 MB
 TARGET_MAX_DOCUMENTS = 25000
 TRIM_TO_DOCUMENTS = 22000
-
-# Also delete very old trades automatically
 MAX_TRADE_AGE_DAYS = 180
 
 # ============================================================
@@ -70,7 +68,7 @@ DEBUG_IGNORED_MESSAGES = False
 # MONGO
 # ============================================================
 
-_use_mongo = bool(MONGO_URI and "YOUR_MONGODB_URI_HERE" not in MONGO_URI)
+_use_mongo = bool(MONGO_URI and "YOUR_MONGODB_URI_HERE" not in MONGO_URI and "PASTE_YOUR_MONGODB_URI_HERE" not in MONGO_URI)
 mongo_client = AsyncIOMotorClient(MONGO_URI) if _use_mongo else None
 db = mongo_client[DB_NAME] if mongo_client is not None else None
 trades_col = db[TRADES_COLLECTION_NAME] if db is not None else None
@@ -100,7 +98,6 @@ exit_pattern = re.compile(
     re.IGNORECASE,
 )
 
-
 def extract_pct(content: str) -> Optional[float]:
     m = pct_regex.search(content)
     if not m:
@@ -109,7 +106,6 @@ def extract_pct(content: str) -> Optional[float]:
         return float(m.group(1))
     except ValueError:
         return None
-
 
 def infer_direction(content: str, pct: Optional[float]) -> Optional[str]:
     lower = content.lower()
@@ -137,7 +133,6 @@ def infer_direction(content: str, pct: Optional[float]) -> Optional[str]:
 
     return None
 
-
 def infer_play_style(content: str) -> Optional[str]:
     lower = content.lower()
     if "scalp" in lower:
@@ -147,7 +142,6 @@ def infer_play_style(content: str) -> Optional[str]:
     if "lotto" in lower or "loto" in lower:
         return "lotto"
     return None
-
 
 def infer_exit_label(content: str, direction: Optional[str]) -> Optional[str]:
     lower = content.lower()
@@ -199,7 +193,6 @@ def infer_exit_label(content: str, direction: Optional[str]) -> Optional[str]:
 
     return None
 
-
 def guess_symbol_and_option_fields(content: str) -> Tuple[Optional[str], Dict[str, Any]]:
     fields: Dict[str, Any] = {
         "contract_type": None,
@@ -227,7 +220,6 @@ def guess_symbol_and_option_fields(content: str) -> Tuple[Optional[str], Dict[st
 
     return symbol, fields
 
-
 def extract_entry_exit(content: str) -> Tuple[Optional[float], Optional[float]]:
     entry = None
     exit_ = None
@@ -247,7 +239,6 @@ def extract_entry_exit(content: str) -> Tuple[Optional[float], Optional[float]]:
             exit_ = None
 
     return entry, exit_
-
 
 def parse_trade_message_with_debug(message: discord.Message) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     reasons: List[str] = []
@@ -325,10 +316,8 @@ def parse_trade_message_with_debug(message: discord.Message) -> Tuple[Optional[D
     trade_doc.update(extra_fields)
     return trade_doc, reasons
 
-
 def format_pct(p: Optional[float]) -> str:
     return f"{p:+.2f}%" if isinstance(p, (int, float)) else "N/A"
-
 
 def format_style_label(style: Optional[str]) -> Optional[str]:
     if not style:
@@ -339,7 +328,6 @@ def format_style_label(style: Optional[str]) -> Optional[str]:
         "lotto": "Lotto",
     }
     return mapping.get(style.lower(), style.title())
-
 
 def format_trade_line(trade: Dict[str, Any]) -> str:
     symbol = trade.get("symbol") or "N/A"
@@ -363,7 +351,6 @@ def format_trade_line(trade: Dict[str, Any]) -> str:
     base = f"**{symbol}** {pct} `{direction}`{tag_str} · #{channel}"
     return f"[{base}]({jump_url})" if jump_url else base
 
-
 def summarize_trades(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     numeric = [t for t in trades if isinstance(t.get("pct"), (int, float))]
     pct_vals = [t["pct"] for t in numeric]
@@ -378,7 +365,6 @@ def summarize_trades(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "best_trade": max(numeric, key=lambda x: x["pct"]) if numeric else None,
         "worst_trade": min(numeric, key=lambda x: x["pct"]) if numeric else None,
     }
-
 
 def compute_streaks(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     seq = sorted(
@@ -411,7 +397,6 @@ def compute_streaks(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "current_len": current_len,
     }
 
-
 async def fetch_all_trades(query: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     if trades_col is None:
         return []
@@ -421,7 +406,6 @@ async def fetch_all_trades(query: Dict[str, Any] = None) -> List[Dict[str, Any]]
         doc["channel_name"] = doc.get("channel_name") or "unknown"
         trades.append(doc)
     return trades
-
 
 async def estimate_storage_stats() -> Dict[str, Any]:
     if db is None:
@@ -444,7 +428,6 @@ async def estimate_storage_stats() -> Dict[str, Any]:
     except Exception:
         logger.exception("Failed to read dbStats")
         return {"ok": False, "reason": "dbStats_failed"}
-
 
 def make_daily_embed(date_label: str, trades: List[Dict[str, Any]]) -> discord.Embed:
     s = summarize_trades(trades)
@@ -478,7 +461,6 @@ def make_daily_embed(date_label: str, trades: List[Dict[str, Any]]) -> discord.E
     desc = "\n".join(f"• {format_trade_line(t)}" for t in trades)
     embed.description = (desc[:3800] + "\n… (truncated)") if len(desc) > 3800 else (desc or "No trades logged.")
     return embed
-
 
 def make_weekly_embed(start_date: datetime, end_date: datetime, trades: List[Dict[str, Any]]) -> discord.Embed:
     s = summarize_trades(trades)
@@ -533,7 +515,6 @@ def make_weekly_embed(start_date: datetime, end_date: datetime, trades: List[Dic
         embed.add_field(name="Highlights", value="\n".join(lines), inline=False)
 
     return embed
-
 
 def make_live_recap_embed(trade: Dict[str, Any]) -> discord.Embed:
     symbol = trade.get("symbol") or "N/A"
@@ -609,7 +590,6 @@ def make_live_recap_embed(trade: Dict[str, Any]) -> discord.Embed:
     embed.set_footer(text=f"Original: {original} • {ts.strftime('%Y-%m-%d %I:%M %p UTC')}")
     return embed
 
-
 def make_debug_embed(message: discord.Message, reasons: List[str]) -> discord.Embed:
     embed = discord.Embed(
         title="🔍 Ignored Message Debug",
@@ -624,7 +604,6 @@ def make_debug_embed(message: discord.Message, reasons: List[str]) -> discord.Em
         embed.add_field(name="Reasons", value=", ".join(reasons), inline=False)
     embed.set_footer(text="Keyword Logger • Debug")
     return embed
-
 
 def make_storage_embed(stats: Dict[str, Any], count: int) -> discord.Embed:
     used_mb = stats.get("total_estimated_mb", 0.0)
@@ -649,7 +628,6 @@ def make_storage_embed(stats: Dict[str, Any], count: int) -> discord.Embed:
     )
     embed.set_footer(text="Estimate only — Atlas or disk usage may differ slightly.")
     return embed
-
 
 def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Pattern Analytics") -> discord.Embed:
     s = summarize_trades(trades)
@@ -783,11 +761,9 @@ def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Patter
 
     return embed
 
-
 def get_channel(channel_id: int) -> Optional[discord.TextChannel]:
     ch = bot.get_channel(channel_id)
     return ch if isinstance(ch, discord.TextChannel) else None
-
 
 async def run_auto_cleanup(reason: str = "scheduled") -> Dict[str, Any]:
     if trades_col is None:
@@ -821,7 +797,6 @@ async def run_auto_cleanup(reason: str = "scheduled") -> Dict[str, Any]:
         "stats": stats,
     }
 
-
 # ============================================================
 # BOT EVENTS
 # ============================================================
@@ -836,6 +811,7 @@ async def on_ready():
         WEEKLY_RECAP_CHANNEL_ID,
         LONG_TERM_STATS_CHANNEL_ID,
         ANALYTICS_CHANNEL_ID,
+        CLEANUP_CHECK_CHANNEL_ID,
     ]:
         ch = get_channel(cid)
         if ch is not None:
@@ -851,15 +827,12 @@ async def on_ready():
     if not weekly_scheduler.is_running():
         weekly_scheduler.start()
 
-    if not daily_scheduler.is_running():
-        daily_scheduler.start()
+    # daily_scheduler intentionally NOT started automatically
 
     if AUTO_CLEANUP_ENABLED and not cleanup_scheduler.is_running():
         cleanup_scheduler.start()
 
-    if not analytics_scheduler.is_running():
-        analytics_scheduler.start()
-
+    # analytics_scheduler intentionally NOT started automatically
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -905,7 +878,6 @@ async def on_message(message: discord.Message):
     except Exception:
         logger.exception("Error in on_message")
 
-
 # ============================================================
 # COMMANDS
 # ============================================================
@@ -913,7 +885,6 @@ async def on_message(message: discord.Message):
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     await ctx.send("Pong.")
-
 
 @bot.command(name="health")
 async def health(ctx: commands.Context):
@@ -932,12 +903,12 @@ async def health(ctx: commands.Context):
             f"Live/Daily: <#{LIVE_RECAP_CHANNEL_ID}>\n"
             f"Weekly: <#{WEEKLY_RECAP_CHANNEL_ID}>\n"
             f"Stats: <#{LONG_TERM_STATS_CHANNEL_ID}>\n"
-            f"Analytics: <#{ANALYTICS_CHANNEL_ID}>"
+            f"Analytics: <#{ANALYTICS_CHANNEL_ID}>\n"
+            f"Cleanup Checks: <#{CLEANUP_CHECK_CHANNEL_ID}>"
         )
     except Exception:
         logger.exception("health failed")
         await ctx.send("health check failed – see logs.")
-
 
 @bot.command(name="debugon")
 @commands.has_permissions(administrator=True)
@@ -946,14 +917,12 @@ async def debug_on(ctx: commands.Context):
     DEBUG_IGNORED_MESSAGES = True
     await ctx.send("Debug mode **enabled**.")
 
-
 @bot.command(name="debugoff")
 @commands.has_permissions(administrator=True)
 async def debug_off(ctx: commands.Context):
     global DEBUG_IGNORED_MESSAGES
     DEBUG_IGNORED_MESSAGES = False
     await ctx.send("Debug mode **disabled**.")
-
 
 @bot.command(name="daily")
 async def daily_summary(ctx: commands.Context):
@@ -978,7 +947,6 @@ async def daily_summary(ctx: commands.Context):
         logger.exception("ERROR in daily_summary")
         await ctx.send("Error generating daily summary.")
 
-
 @bot.command(name="weekly")
 async def weekly_summary(ctx: commands.Context):
     try:
@@ -1001,7 +969,6 @@ async def weekly_summary(ctx: commands.Context):
     except Exception:
         logger.exception("ERROR in weekly_summary")
         await ctx.send("Error generating weekly summary.")
-
 
 @bot.command(name="monthly")
 async def monthly_summary(ctx: commands.Context):
@@ -1027,7 +994,6 @@ async def monthly_summary(ctx: commands.Context):
     except Exception:
         logger.exception("ERROR in monthly_summary")
         await ctx.send("Error generating monthly summary.")
-
 
 @bot.command(name="stats")
 async def stats_command(ctx: commands.Context):
@@ -1089,7 +1055,6 @@ async def stats_command(ctx: commands.Context):
         logger.exception("ERROR in stats_command")
         await ctx.send("Error generating stats.")
 
-
 @bot.command(name="analytics")
 async def analytics_command(ctx: commands.Context, scope: str = "all", value: str = None):
     try:
@@ -1144,7 +1109,6 @@ async def analytics_command(ctx: commands.Context, scope: str = "all", value: st
         logger.exception("ERROR in analytics_command")
         await ctx.send("Error generating analytics.")
 
-
 @bot.command(name="ticker")
 async def ticker_command(ctx: commands.Context, symbol: str):
     try:
@@ -1196,7 +1160,6 @@ async def ticker_command(ctx: commands.Context, symbol: str):
         logger.exception("ERROR in ticker_command")
         await ctx.send("Error generating ticker stats.")
 
-
 @bot.command(name="streaks")
 async def streaks_command(ctx: commands.Context):
     try:
@@ -1231,7 +1194,6 @@ async def streaks_command(ctx: commands.Context):
         logger.exception("ERROR in streaks_command")
         await ctx.send("Error generating streak stats.")
 
-
 @bot.command(name="rawcount")
 async def rawcount(ctx: commands.Context, scope: str = "all"):
     try:
@@ -1261,7 +1223,6 @@ async def rawcount(ctx: commands.Context, scope: str = "all"):
         logger.exception("ERROR in rawcount")
         await ctx.send("Error counting trades.")
 
-
 @bot.command(name="storage")
 async def storage_command(ctx: commands.Context):
     try:
@@ -1282,7 +1243,6 @@ async def storage_command(ctx: commands.Context):
     except Exception:
         logger.exception("ERROR in storage_command")
         await ctx.send("Error reading storage stats.")
-
 
 @bot.command(name="cleanup")
 @commands.has_permissions(administrator=True)
@@ -1310,7 +1270,6 @@ async def cleanup_command(ctx: commands.Context):
         logger.exception("ERROR in cleanup_command")
         await ctx.send("Error running cleanup.")
 
-
 @bot.command(name="deleteday")
 @commands.has_permissions(administrator=True)
 async def delete_day_command(ctx: commands.Context, day_str: str):
@@ -1334,14 +1293,13 @@ async def delete_day_command(ctx: commands.Context, day_str: str):
         res = await trades_col.delete_many({"created_at": {"$gte": start, "$lt": end}})
         await ctx.send(f"Deleted **{res.deleted_count}** trade logs from **{day_str}**.")
 
-        analytics_ch = get_channel(ANALYTICS_CHANNEL_ID)
-        if analytics_ch is not None:
-            await analytics_ch.send(f"🗑️ Manual daily purge completed for **{day_str}** • Removed **{res.deleted_count}** logs.")
+        cleanup_ch = get_channel(CLEANUP_CHECK_CHANNEL_ID)
+        if cleanup_ch is not None:
+            await cleanup_ch.send(f"🗑️ Manual daily purge completed for **{day_str}** • Removed **{res.deleted_count}** logs.")
 
     except Exception:
         logger.exception("ERROR in delete_day_command")
         await ctx.send("Error deleting that day of logs.")
-
 
 @bot.command(name="logtrade")
 async def logtrade(ctx: commands.Context, symbol: str, pct: float, direction: str = None, classification: str = None, *, note: str = ""):
@@ -1390,7 +1348,6 @@ async def logtrade(ctx: commands.Context, symbol: str, pct: float, direction: st
     except Exception:
         logger.exception("ERROR in logtrade")
         await ctx.send("Error logging manual trade.")
-
 
 @bot.command(name="edittrade")
 async def edittrade(ctx: commands.Context, message_id: int, *fields: str):
@@ -1441,7 +1398,6 @@ async def edittrade(ctx: commands.Context, message_id: int, *fields: str):
         logger.exception("ERROR in edittrade")
         await ctx.send("Error editing trade.")
 
-
 @bot.command(name="deletetrade")
 async def deletetrade(ctx: commands.Context, message_id: int):
     try:
@@ -1458,7 +1414,6 @@ async def deletetrade(ctx: commands.Context, message_id: int):
     except Exception:
         logger.exception("ERROR in deletetrade")
         await ctx.send("Error deleting trade.")
-
 
 @bot.command(name="helpbot")
 async def helpbot(ctx: commands.Context):
@@ -1492,7 +1447,6 @@ async def helpbot(ctx: commands.Context):
     embed.set_footer(text="Watched: " + " | ".join(str(c) for c in WATCHED_CHANNEL_IDS))
     await ctx.send(embed=embed)
 
-
 # ============================================================
 # SCHEDULED TASKS
 # ============================================================
@@ -1523,11 +1477,9 @@ async def weekly_scheduler():
     except Exception:
         logger.exception("ERROR in weekly_scheduler")
 
-
 @weekly_scheduler.before_loop
 async def before_weekly():
     await bot.wait_until_ready()
-
 
 @tasks.loop(hours=24)
 async def daily_scheduler():
@@ -1553,11 +1505,9 @@ async def daily_scheduler():
     except Exception:
         logger.exception("ERROR in daily_scheduler")
 
-
 @daily_scheduler.before_loop
 async def before_daily():
     await bot.wait_until_ready()
-
 
 @tasks.loop(hours=AUTO_CLEANUP_INTERVAL_HOURS)
 async def cleanup_scheduler():
@@ -1569,10 +1519,10 @@ async def cleanup_scheduler():
         if not result.get("ok"):
             return
 
-        analytics_ch = get_channel(ANALYTICS_CHANNEL_ID)
-        if analytics_ch is not None and (result["deleted_total"] > 0 or result["stats"].get("ok")):
+        cleanup_ch = get_channel(CLEANUP_CHECK_CHANNEL_ID)
+        if cleanup_ch is not None and (result["deleted_total"] > 0 or result["stats"].get("ok")):
             used_mb = result["stats"].get("total_estimated_mb", 0.0) if result["stats"].get("ok") else 0.0
-            await analytics_ch.send(
+            await cleanup_ch.send(
                 f"🧹 Auto cleanup check complete.\n"
                 f"Deleted: **{result['deleted_total']}**\n"
                 f"Remaining docs: **{result['count_after']}**\n"
@@ -1582,11 +1532,9 @@ async def cleanup_scheduler():
     except Exception:
         logger.exception("ERROR in cleanup_scheduler")
 
-
 @cleanup_scheduler.before_loop
 async def before_cleanup():
     await bot.wait_until_ready()
-
 
 @tasks.loop(hours=24)
 async def analytics_scheduler():
@@ -1609,25 +1557,22 @@ async def analytics_scheduler():
     except Exception:
         logger.exception("ERROR in analytics_scheduler")
 
-
 @analytics_scheduler.before_loop
 async def before_analytics():
     await bot.wait_until_ready()
-
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    if not DISCORD_TOKEN or "YOUR_DISCORD_BOT_TOKEN_HERE" in DISCORD_TOKEN:
+    if not DISCORD_TOKEN or "YOUR_DISCORD_BOT_TOKEN_HERE" in DISCORD_TOKEN or "PASTE_YOUR_DISCORD_BOT_TOKEN_HERE" in DISCORD_TOKEN:
         raise RuntimeError("Paste your real Discord bot token into DISCORD_TOKEN at the top of the script.")
-    if not MONGO_URI or "YOUR_MONGODB_URI_HERE" in MONGO_URI:
+    if not MONGO_URI or "YOUR_MONGODB_URI_HERE" in MONGO_URI or "PASTE_YOUR_MONGODB_URI_HERE" in MONGO_URI:
         logger.warning("MONGO_URI is not set correctly – DB features will not work.")
 
     logger.info("Starting bot...")
     bot.run(DISCORD_TOKEN)
-
 
 if __name__ == "__main__":
     main()
