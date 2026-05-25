@@ -19,9 +19,9 @@ DB_NAME = "TradeRecap"
 TRADES_COLLECTION_NAME = "trades"
 
 WATCHED_CHANNEL_IDS = [
-    1439856570061033565,
-    1462285627000094896,
-    1477839908562407485,
+    1439856570061033565,  # swing
+    1462285627000094896,  # swing
+    1477839908562407485,  # daytrade
 ]
 
 LIVE_RECAP_CHANNEL_ID = 1459297868861931715
@@ -34,6 +34,16 @@ CLEANUP_CHECK_CHANNEL_ID = 1508602677393887262
 COMMAND_PREFIX = "!"
 
 # ============================================================
+# STYLE MAPPING BY CHANNEL
+# ============================================================
+
+DAYTRADE_CHANNEL_ID = 1477839908562407485
+SWING_CHANNEL_IDS = {
+    1439856570061033565,
+    1462285627000094896,
+}
+
+# ============================================================
 # STORAGE / CLEANUP SETTINGS
 # ============================================================
 
@@ -44,6 +54,9 @@ AUTO_CLEANUP_INTERVAL_HOURS = 12
 TARGET_MAX_DOCUMENTS = 25000
 TRIM_TO_DOCUMENTS = 22000
 MAX_TRADE_AGE_DAYS = 180
+
+LIST_TRADES_DEFAULT_LIMIT = 25
+LIST_TRADES_MAX_LIMIT = 100
 
 # ============================================================
 # BOT SETUP
@@ -68,7 +81,11 @@ DEBUG_IGNORED_MESSAGES = False
 # MONGO
 # ============================================================
 
-_use_mongo = bool(MONGO_URI and "YOUR_MONGODB_URI_HERE" not in MONGO_URI and "PASTE_YOUR_MONGODB_URI_HERE" not in MONGO_URI)
+_use_mongo = bool(
+    MONGO_URI
+    and "YOUR_MONGODB_URI_HERE" not in MONGO_URI
+    and "PASTE_YOUR_MONGODB_URI_HERE" not in MONGO_URI
+)
 mongo_client = AsyncIOMotorClient(MONGO_URI) if _use_mongo else None
 db = mongo_client[DB_NAME] if mongo_client is not None else None
 trades_col = db[TRADES_COLLECTION_NAME] if db is not None else None
@@ -240,6 +257,13 @@ def extract_entry_exit(content: str) -> Tuple[Optional[float], Optional[float]]:
 
     return entry, exit_
 
+def channel_style_label(channel_id: Optional[int]) -> str:
+    if channel_id == DAYTRADE_CHANNEL_ID:
+        return "Daytrade"
+    if channel_id in SWING_CHANNEL_IDS:
+        return "Swing"
+    return "Other"
+
 def parse_trade_message_with_debug(message: discord.Message) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     reasons: List[str] = []
 
@@ -305,6 +329,7 @@ def parse_trade_message_with_debug(message: discord.Message) -> Tuple[Optional[D
         "pct": pct,
         "direction": direction,
         "classification": play_style,
+        "channel_style": channel_style_label(message.channel.id),
         "exit_label": exit_label,
         "symbol": symbol,
         "jump_url": message.jump_url,
@@ -317,7 +342,14 @@ def parse_trade_message_with_debug(message: discord.Message) -> Tuple[Optional[D
     return trade_doc, reasons
 
 def format_pct(p: Optional[float]) -> str:
-    return f"{p:+.2f}%" if isinstance(p, (int, float)) else "N/A"
+    if not isinstance(p, (int, float)):
+        return "N/A"
+    rounded = int(round(p))
+    if rounded > 0:
+        return f"+{rounded}%"
+    if rounded < 0:
+        return f"{rounded}%"
+    return "0%"
 
 def format_style_label(style: Optional[str]) -> Optional[str]:
     if not style:
@@ -339,9 +371,11 @@ def format_trade_line(trade: Dict[str, Any]) -> str:
     tags = []
     if trade.get("exit_label"):
         tags.append(trade["exit_label"])
-    style_label = format_style_label(trade.get("classification"))
-    if style_label:
-        tags.append(style_label)
+
+    style_bucket = trade.get("channel_style") or channel_style_label(trade.get("channel_id"))
+    if style_bucket in ("Swing", "Daytrade"):
+        tags.append(style_bucket)
+
     if trade.get("contract_type"):
         tags.append(str(trade["contract_type"]).title())
     if trade.get("option_type"):
@@ -397,13 +431,20 @@ def compute_streaks(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "current_len": current_len,
     }
 
-async def fetch_all_trades(query: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+async def fetch_all_trades(query: Dict[str, Any] = None, limit: Optional[int] = None, newest_first: bool = False) -> List[Dict[str, Any]]:
     if trades_col is None:
         return []
 
+    cursor = trades_col.find(query or {})
+    cursor = cursor.sort("created_at", -1 if newest_first else 1)
+    if limit:
+        cursor = cursor.limit(limit)
+
     trades: List[Dict[str, Any]] = []
-    async for doc in trades_col.find(query or {}):
+    async for doc in cursor:
         doc["channel_name"] = doc.get("channel_name") or "unknown"
+        if not doc.get("channel_style"):
+            doc["channel_style"] = channel_style_label(doc.get("channel_id"))
         trades.append(doc)
     return trades
 
@@ -416,18 +457,31 @@ async def estimate_storage_stats() -> Dict[str, Any]:
         data_size = stats.get("dataSize", 0)
         storage_size = stats.get("storageSize", 0)
         index_size = stats.get("indexSize", 0)
-        total_size = data_size + index_size
+        logical_total = data_size + index_size
+        allocated_total = storage_size + index_size
         return {
             "ok": True,
             "data_size_bytes": data_size,
             "storage_size_bytes": storage_size,
             "index_size_bytes": index_size,
-            "total_estimated_bytes": total_size,
-            "total_estimated_mb": total_size / (1024 * 1024),
+            "logical_total_bytes": logical_total,
+            "logical_total_mb": logical_total / (1024 * 1024),
+            "allocated_total_bytes": allocated_total,
+            "allocated_total_mb": allocated_total / (1024 * 1024),
         }
     except Exception:
         logger.exception("Failed to read dbStats")
         return {"ok": False, "reason": "dbStats_failed"}
+
+async def compact_collection_if_possible() -> Dict[str, Any]:
+    if db is None:
+        return {"ok": False, "reason": "db_not_configured"}
+
+    try:
+        result = await db.command({"compact": TRADES_COLLECTION_NAME})
+        return {"ok": True, "result": result}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
 
 def make_daily_embed(date_label: str, trades: List[Dict[str, Any]]) -> discord.Embed:
     s = summarize_trades(trades)
@@ -444,8 +498,8 @@ def make_daily_embed(date_label: str, trades: List[Dict[str, Any]]) -> discord.E
         name="Overview",
         value=(
             f"Trades: **{total}** • Wins: **{s['wins']}** • Losses: **{s['losses']}**\n"
-            f"Win Rate: **{win_rate:.1f}%**\n"
-            f"Total PnL: **{s['total_pnl']:+.2f}%** • Avg PnL: **{s['avg_pnl']:+.2f}%**"
+            f"Win Rate: **{round(win_rate):.0f}%**\n"
+            f"Total PnL: **{format_pct(s['total_pnl'])}** • Avg PnL: **{format_pct(s['avg_pnl'])}**"
         ),
         inline=False,
     )
@@ -478,8 +532,8 @@ def make_weekly_embed(start_date: datetime, end_date: datetime, trades: List[Dic
         name="Overview",
         value=(
             f"Trades: **{total}** • Wins: **{s['wins']}** • Losses: **{s['losses']}**\n"
-            f"Win Rate: **{win_rate:.1f}%**\n"
-            f"Total PnL: **{s['total_pnl']:+.2f}%** • Avg PnL: **{s['avg_pnl']:+.2f}%**"
+            f"Win Rate: **{round(win_rate):.0f}%**\n"
+            f"Total PnL: **{format_pct(s['total_pnl'])}** • Avg PnL: **{format_pct(s['avg_pnl'])}**"
         ),
         inline=False,
     )
@@ -497,7 +551,7 @@ def make_weekly_embed(start_date: datetime, end_date: datetime, trades: List[Dic
     for date_key in sorted(by_day):
         day_trades = by_day[date_key]
         day_s = summarize_trades(day_trades)
-        lines = [f"Trades: **{day_s['total_trades']}** • PnL: **{day_s['total_pnl']:+.2f}%**", ""]
+        lines = [f"Trades: **{day_s['total_trades']}** • PnL: **{format_pct(day_s['total_pnl'])}**", ""]
         lines += [f"• {format_trade_line(t)}" for t in day_trades]
         value = "\n".join(lines)
         embed.add_field(
@@ -533,12 +587,14 @@ def make_live_recap_embed(trade: Dict[str, Any]) -> discord.Embed:
     embed.add_field(name="Trader", value=trader_value, inline=True)
     embed.add_field(name="Channel", value=channel_value, inline=True)
 
-    style_label = format_style_label(trade.get("classification"))
     classification_parts = []
     if trade.get("exit_label"):
         classification_parts.append(trade["exit_label"])
-    if style_label:
-        classification_parts.append(style_label)
+
+    style_bucket = trade.get("channel_style") or channel_style_label(trade.get("channel_id"))
+    if style_bucket in ("Swing", "Daytrade"):
+        classification_parts.append(style_bucket)
+
     if classification_parts:
         embed.add_field(name="Classification", value=" • ".join(classification_parts), inline=False)
 
@@ -606,8 +662,12 @@ def make_debug_embed(message: discord.Message, reasons: List[str]) -> discord.Em
     return embed
 
 def make_storage_embed(stats: Dict[str, Any], count: int) -> discord.Embed:
-    used_mb = stats.get("total_estimated_mb", 0.0)
-    pct_used = (used_mb / MAX_DB_SIZE_MB * 100.0) if MAX_DB_SIZE_MB > 0 else 0.0
+    logical_mb = stats.get("logical_total_mb", 0.0)
+    allocated_mb = stats.get("allocated_total_mb", 0.0)
+    data_mb = stats.get("data_size_bytes", 0) / (1024 * 1024)
+    storage_mb = stats.get("storage_size_bytes", 0) / (1024 * 1024)
+    index_mb = stats.get("index_size_bytes", 0) / (1024 * 1024)
+    pct_used = (allocated_mb / MAX_DB_SIZE_MB * 100.0) if MAX_DB_SIZE_MB > 0 else 0.0
 
     embed = discord.Embed(
         title="💾 Storage Estimate",
@@ -615,18 +675,23 @@ def make_storage_embed(stats: Dict[str, Any], count: int) -> discord.Embed:
         timestamp=datetime.utcnow(),
     )
     embed.add_field(name="Documents", value=str(count), inline=True)
-    embed.add_field(name="Estimated Used", value=f"{used_mb:.2f} MB", inline=True)
+    embed.add_field(name="Logical Used", value=f"{logical_mb:.2f} MB", inline=True)
+    embed.add_field(name="Allocated Used", value=f"{allocated_mb:.2f} MB", inline=True)
     embed.add_field(name="512 MB Limit", value=f"{pct_used:.1f}%", inline=True)
     embed.add_field(
         name="Breakdown",
         value=(
-            f"Data: {stats.get('data_size_bytes', 0) / (1024 * 1024):.2f} MB\n"
-            f"Indexes: {stats.get('index_size_bytes', 0) / (1024 * 1024):.2f} MB\n"
-            f"Storage: {stats.get('storage_size_bytes', 0) / (1024 * 1024):.2f} MB"
+            f"Data Size: {data_mb:.2f} MB\n"
+            f"Storage Size: {storage_mb:.2f} MB\n"
+            f"Index Size: {index_mb:.2f} MB"
         ),
         inline=False,
     )
-    embed.set_footer(text="Estimate only — Atlas or disk usage may differ slightly.")
+    embed.add_field(
+        name="Note",
+        value="Logical size drops after deletes. Allocated/storage size may stay high because MongoDB often keeps freed space for reuse.",
+        inline=False,
+    )
     return embed
 
 def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Pattern Analytics") -> discord.Embed:
@@ -646,15 +711,14 @@ def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Patter
         value=(
             f"Trades: **{total}**\n"
             f"Wins: **{s['wins']}** • Losses: **{s['losses']}**\n"
-            f"Win Rate: **{win_rate:.1f}%**\n"
-            f"Total PnL: **{s['total_pnl']:+.2f}%** • Avg PnL: **{s['avg_pnl']:+.2f}%**"
+            f"Win Rate: **{round(win_rate):.0f}%**\n"
+            f"Total PnL: **{format_pct(s['total_pnl'])}** • Avg PnL: **{format_pct(s['avg_pnl'])}**"
         ),
         inline=False,
     )
 
-    scalps = [t for t in trades if t.get("classification") == "scalp"]
-    swings = [t for t in trades if t.get("classification") == "swing"]
-    lottos = [t for t in trades if t.get("classification") == "lotto"]
+    swings = [t for t in trades if (t.get("channel_style") or channel_style_label(t.get("channel_id"))) == "Swing"]
+    daytrades = [t for t in trades if (t.get("channel_style") or channel_style_label(t.get("channel_id"))) == "Daytrade"]
 
     def calc_wr(lst: List[Dict[str, Any]]) -> float:
         if not lst:
@@ -667,9 +731,8 @@ def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Patter
         return sum(vals) / len(vals) if vals else 0.0
 
     style_lines = [
-        f"Scalps: **{len(scalps)}** trades • WR **{calc_wr(scalps):.1f}%** • Avg **{calc_avg(scalps):+.2f}%**",
-        f"Swings: **{len(swings)}** trades • WR **{calc_wr(swings):.1f}%** • Avg **{calc_avg(swings):+.2f}%**",
-        f"Lottos: **{len(lottos)}** trades • WR **{calc_wr(lottos):.1f}%** • Avg **{calc_avg(lottos):+.2f}%**",
+        f"Swing: **{len(swings)}** trades • WR **{round(calc_wr(swings)):.0f}%** • Avg **{format_pct(calc_avg(swings))}**",
+        f"Daytrade: **{len(daytrades)}** trades • WR **{round(calc_wr(daytrades)):.0f}%** • Avg **{format_pct(calc_avg(daytrades))}**",
     ]
     embed.add_field(name="By Style", value="\n".join(style_lines), inline=False)
 
@@ -681,7 +744,7 @@ def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Patter
     top_exit_lines = []
     for label, lst in sorted(exit_groups.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]:
         top_exit_lines.append(
-            f"{label}: **{len(lst)}** trades • WR **{calc_wr(lst):.1f}%** • Avg **{calc_avg(lst):+.2f}%**"
+            f"{label}: **{len(lst)}** trades • WR **{round(calc_wr(lst)):.0f}%** • Avg **{format_pct(calc_avg(lst))}**"
         )
     if top_exit_lines:
         embed.add_field(name="By Exit Pattern", value="\n".join(top_exit_lines), inline=False)
@@ -706,7 +769,7 @@ def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Patter
     if best_tickers:
         embed.add_field(
             name="Best Tickers",
-            value="\n".join(f"{sym}: **{pnl:+.2f}%**" for sym, pnl in best_tickers),
+            value="\n".join(f"{sym}: **{format_pct(pnl)}**" for sym, pnl in best_tickers),
             inline=True,
         )
 
@@ -731,8 +794,8 @@ def make_analytics_embed(trades: List[Dict[str, Any]], title: str = "📈 Patter
         embed.add_field(
             name="Day Patterns",
             value=(
-                f"Best Day: **{day_names[best_day[0]]}** ({best_day[1]['pnl']:+.2f}%)\n"
-                f"Worst Day: **{day_names[worst_day[0]]}** ({worst_day[1]['pnl']:+.2f}%)"
+                f"Best Day: **{day_names[best_day[0]]}** ({format_pct(best_day[1]['pnl'])})\n"
+                f"Worst Day: **{day_names[worst_day[0]]}** ({format_pct(worst_day[1]['pnl'])})"
             ),
             inline=False,
         )
@@ -787,14 +850,18 @@ async def run_auto_cleanup(reason: str = "scheduled") -> Dict[str, Any]:
             deleted_total += trim_result.deleted_count
 
     total_count_after = await trades_col.count_documents({})
-    stats = await estimate_storage_stats()
+    stats_before_compact = await estimate_storage_stats()
+    compact_result = await compact_collection_if_possible()
+    stats_after_compact = await estimate_storage_stats()
 
     return {
         "ok": True,
         "reason": reason,
         "deleted_total": deleted_total,
         "count_after": total_count_after,
-        "stats": stats,
+        "stats": stats_after_compact,
+        "stats_before_compact": stats_before_compact,
+        "compact_result": compact_result,
     }
 
 # ============================================================
@@ -827,12 +894,8 @@ async def on_ready():
     if not weekly_scheduler.is_running():
         weekly_scheduler.start()
 
-    # daily_scheduler intentionally NOT started automatically
-
     if AUTO_CLEANUP_ENABLED and not cleanup_scheduler.is_running():
         cleanup_scheduler.start()
-
-    # analytics_scheduler intentionally NOT started automatically
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -1030,15 +1093,15 @@ async def stats_command(ctx: commands.Context):
             name="Overview",
             value=(
                 f"Trades: **{total}** • Wins: **{wins}** • Losses: **{losses}**\n"
-                f"Win Rate: **{win_rate:.1f}%**\n"
-                f"Total PnL: **{s['total_pnl']:+.2f}%** • Avg PnL: **{s['avg_pnl']:+.2f}%**"
+                f"Win Rate: **{round(win_rate):.0f}%**\n"
+                f"Total PnL: **{format_pct(s['total_pnl'])}** • Avg PnL: **{format_pct(s['avg_pnl'])}**"
             ),
             inline=False,
         )
         if top_count:
             embed.add_field(name="Most Traded Tickers", value="\n".join(f"• {sym}: **{cnt}** trades" for sym, cnt in top_count), inline=True)
         if top_pnl:
-            embed.add_field(name="Top PnL Tickers", value="\n".join(f"• {sym}: **{pnl:+.2f}%**" for sym, pnl in top_pnl), inline=True)
+            embed.add_field(name="Top PnL Tickers", value="\n".join(f"• {sym}: **{format_pct(pnl)}**" for sym, pnl in top_pnl), inline=True)
 
         lines = []
         if s["best_trade"]:
@@ -1135,8 +1198,8 @@ async def ticker_command(ctx: commands.Context, symbol: str):
             name="Overview",
             value=(
                 f"Trades: **{total}** • Wins: **{wins}** • Losses: **{losses}**\n"
-                f"Win Rate: **{win_rate:.1f}%**\n"
-                f"Total PnL: **{s['total_pnl']:+.2f}%** • Avg PnL: **{s['avg_pnl']:+.2f}%**"
+                f"Win Rate: **{round(win_rate):.0f}%**\n"
+                f"Total PnL: **{format_pct(s['total_pnl'])}** • Avg PnL: **{format_pct(s['avg_pnl'])}**"
             ),
             inline=False,
         )
@@ -1258,12 +1321,23 @@ async def cleanup_command(ctx: commands.Context):
             return
 
         stats = result.get("stats", {})
-        used_mb = stats.get("total_estimated_mb", 0.0) if stats.get("ok") else 0.0
+        logical_mb = stats.get("logical_total_mb", 0.0) if stats.get("ok") else 0.0
+        allocated_mb = stats.get("allocated_total_mb", 0.0) if stats.get("ok") else 0.0
+        compact_result = result.get("compact_result", {})
+
+        compact_note = "compact not run / not allowed"
+        if compact_result.get("ok"):
+            compact_note = "compact command attempted"
+        elif compact_result.get("reason"):
+            compact_note = f"compact unavailable: {compact_result['reason'][:120]}"
+
         await ctx.send(
             f"Cleanup complete.\n"
             f"Deleted: **{result['deleted_total']}**\n"
             f"Remaining docs: **{result['count_after']}**\n"
-            f"Estimated size: **{used_mb:.2f} MB**"
+            f"Logical size: **{logical_mb:.2f} MB**\n"
+            f"Allocated size: **{allocated_mb:.2f} MB**\n"
+            f"Note: **{compact_note}**"
         )
 
     except Exception:
@@ -1301,6 +1375,108 @@ async def delete_day_command(ctx: commands.Context, day_str: str):
         logger.exception("ERROR in delete_day_command")
         await ctx.send("Error deleting that day of logs.")
 
+@bot.command(name="deletealllogs")
+@commands.has_permissions(administrator=True)
+async def delete_all_logs_command(ctx: commands.Context, confirm: str = ""):
+    try:
+        if trades_col is None:
+            await ctx.send("Database not configured.")
+            return
+
+        if confirm.upper() != "CONFIRM":
+            await ctx.send("This deletes **all** logged trades. Use `!deletealllogs CONFIRM`")
+            return
+
+        count_before = await trades_col.count_documents({})
+        if count_before == 0:
+            await ctx.send("No logs exist.")
+            return
+
+        res = await trades_col.delete_many({})
+        compact_result = await compact_collection_if_possible()
+        stats = await estimate_storage_stats()
+
+        logical_mb = stats.get("logical_total_mb", 0.0) if stats.get("ok") else 0.0
+        allocated_mb = stats.get("allocated_total_mb", 0.0) if stats.get("ok") else 0.0
+
+        compact_note = "compact not run / not allowed"
+        if compact_result.get("ok"):
+            compact_note = "compact command attempted"
+        elif compact_result.get("reason"):
+            compact_note = f"compact unavailable: {compact_result['reason'][:120]}"
+
+        await ctx.send(
+            f"Deleted **{res.deleted_count}** total logs.\n"
+            f"Logical size now: **{logical_mb:.2f} MB**\n"
+            f"Allocated size now: **{allocated_mb:.2f} MB**\n"
+            f"Note: **{compact_note}**"
+        )
+
+        cleanup_ch = get_channel(CLEANUP_CHECK_CHANNEL_ID)
+        if cleanup_ch is not None:
+            await cleanup_ch.send(
+                f"🚨 Full log wipe completed.\n"
+                f"Deleted: **{res.deleted_count}**\n"
+                f"Logical size: **{logical_mb:.2f} MB**\n"
+                f"Allocated size: **{allocated_mb:.2f} MB**"
+            )
+
+    except Exception:
+        logger.exception("ERROR in delete_all_logs_command")
+        await ctx.send("Error deleting all logs.")
+
+@bot.command(name="listtrades")
+async def listtrades_command(ctx: commands.Context, limit: int = LIST_TRADES_DEFAULT_LIMIT):
+    try:
+        if trades_col is None:
+            await ctx.send("Database not configured.")
+            return
+
+        limit = max(1, min(limit, LIST_TRADES_MAX_LIMIT))
+        trades = await fetch_all_trades(limit=limit, newest_first=True)
+
+        if not trades:
+            await ctx.send("No trades logged yet.")
+            return
+
+        chunks = []
+        lines = []
+        current_len = 0
+
+        for idx, trade in enumerate(trades, start=1):
+            ts = trade.get("created_at") or trade.get("timestamp") or datetime.utcnow()
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts)
+                except Exception:
+                    ts = datetime.utcnow()
+
+            line = f"{idx}. `{ts.strftime('%Y-%m-%d')}` {format_trade_line(trade)}"
+            if current_len + len(line) + 1 > 3800:
+                chunks.append("\n".join(lines))
+                lines = [line]
+                current_len = len(line)
+            else:
+                lines.append(line)
+                current_len += len(line) + 1
+
+        if lines:
+            chunks.append("\n".join(lines))
+
+        for i, chunk in enumerate(chunks, start=1):
+            embed = discord.Embed(
+                title=f"📜 Logged Trades ({limit} newest) • Page {i}/{len(chunks)}",
+                description=chunk,
+                color=discord.Color.dark_gold(),
+                timestamp=datetime.utcnow(),
+            )
+            embed.set_footer(text="Use !listtrades [limit] • max 100")
+            await ctx.send(embed=embed)
+
+    except Exception:
+        logger.exception("ERROR in listtrades_command")
+        await ctx.send("Error listing trades.")
+
 @bot.command(name="logtrade")
 async def logtrade(ctx: commands.Context, symbol: str, pct: float, direction: str = None, classification: str = None, *, note: str = ""):
     try:
@@ -1326,11 +1502,12 @@ async def logtrade(ctx: commands.Context, symbol: str, pct: float, direction: st
             "channel_name": getattr(ctx.channel, "name", "unknown"),
             "author_id": ctx.author.id,
             "author_name": str(ctx.author),
-            "content": note or f"Manual log {sym} {pct:+.2f}%",
-            "summary": note or f"{sym} {pct:+.2f}% {d or ''} {c or ''}",
+            "content": note or f"Manual log {sym} {format_pct(pct)}",
+            "summary": note or f"{sym} {format_pct(pct)} {d or ''} {c or ''}",
             "pct": float(pct),
             "direction": d,
             "classification": c,
+            "channel_style": channel_style_label(ctx.channel.id),
             "exit_label": exit_label,
             "symbol": sym,
             "jump_url": ctx.message.jump_url,
@@ -1343,7 +1520,7 @@ async def logtrade(ctx: commands.Context, symbol: str, pct: float, direction: st
         await trades_col.insert_one(doc)
         live_ch = get_channel(LIVE_RECAP_CHANNEL_ID) or ctx.channel
         await live_ch.send(embed=make_live_recap_embed(doc))
-        await ctx.send(f"Manual trade logged for **{sym}** {pct:+.2f}%.")
+        await ctx.send(f"Manual trade logged for **{sym}** {format_pct(pct)}.")
 
     except Exception:
         logger.exception("ERROR in logtrade")
@@ -1390,6 +1567,8 @@ async def edittrade(ctx: commands.Context, message_id: int, *fields: str):
 
         await trades_col.update_one({"message_id": message_id}, {"$set": updates})
         updated = await trades_col.find_one({"message_id": message_id})
+        if updated is not None and not updated.get("channel_style"):
+            updated["channel_style"] = channel_style_label(updated.get("channel_id"))
         embed = make_live_recap_embed(updated)
         embed.title = "✏️ Trade Updated"
         await ctx.send(embed=embed)
@@ -1427,17 +1606,19 @@ async def helpbot(ctx: commands.Context):
             "`!ticker TSLA`\n"
             "`!streaks`\n"
             "`!rawcount [all|today|week]`\n"
-            "`!storage`"
+            "`!storage`\n"
+            "`!listtrades [limit]`"
         ),
         inline=False,
     )
     embed.add_field(
         name="Logging / Cleanup",
         value=(
-            "`!logtrade SYMBOL PCT [win|loss] [scalp|swing|lotto] [note...]`\n"
+            "`!logtrade SYMBOL PCT [win|loss] [classification] [note...]`\n"
             "`!edittrade message_id field=value ...`\n"
             "`!deletetrade message_id`\n"
             "`!deleteday YYYY-MM-DD` *(admin)*\n"
+            "`!deletealllogs CONFIRM` *(admin)*\n"
             "`!cleanup` *(admin)*\n"
             "`!health`"
         ),
@@ -1481,34 +1662,6 @@ async def weekly_scheduler():
 async def before_weekly():
     await bot.wait_until_ready()
 
-@tasks.loop(hours=24)
-async def daily_scheduler():
-    try:
-        if trades_col is None:
-            return
-
-        now_utc = datetime.utcnow()
-        start = datetime(now_utc.year, now_utc.month, now_utc.day)
-        end = start + timedelta(days=1)
-
-        trades = await fetch_all_trades({"created_at": {"$gte": start, "$lt": end}})
-        if not trades:
-            logger.info("daily_scheduler: no trades.")
-            return
-
-        ch = get_channel(DAILY_RECAP_CHANNEL_ID)
-        if ch is not None:
-            await ch.send(embed=make_daily_embed(start.strftime("%Y-%m-%d"), trades))
-        else:
-            logger.warning("daily_scheduler: channel not found")
-
-    except Exception:
-        logger.exception("ERROR in daily_scheduler")
-
-@daily_scheduler.before_loop
-async def before_daily():
-    await bot.wait_until_ready()
-
 @tasks.loop(hours=AUTO_CLEANUP_INTERVAL_HOURS)
 async def cleanup_scheduler():
     try:
@@ -1520,13 +1673,25 @@ async def cleanup_scheduler():
             return
 
         cleanup_ch = get_channel(CLEANUP_CHECK_CHANNEL_ID)
-        if cleanup_ch is not None and (result["deleted_total"] > 0 or result["stats"].get("ok")):
-            used_mb = result["stats"].get("total_estimated_mb", 0.0) if result["stats"].get("ok") else 0.0
+        if cleanup_ch is not None:
+            stats = result["stats"]
+            logical_mb = stats.get("logical_total_mb", 0.0) if stats.get("ok") else 0.0
+            allocated_mb = stats.get("allocated_total_mb", 0.0) if stats.get("ok") else 0.0
+            compact_result = result.get("compact_result", {})
+
+            compact_note = "compact not run / not allowed"
+            if compact_result.get("ok"):
+                compact_note = "compact command attempted"
+            elif compact_result.get("reason"):
+                compact_note = f"compact unavailable: {compact_result['reason'][:120]}"
+
             await cleanup_ch.send(
                 f"🧹 Auto cleanup check complete.\n"
                 f"Deleted: **{result['deleted_total']}**\n"
                 f"Remaining docs: **{result['count_after']}**\n"
-                f"Estimated size: **{used_mb:.2f} MB / {MAX_DB_SIZE_MB} MB**"
+                f"Logical size: **{logical_mb:.2f} MB**\n"
+                f"Allocated size: **{allocated_mb:.2f} MB / {MAX_DB_SIZE_MB} MB**\n"
+                f"Note: **{compact_note}**"
             )
 
     except Exception:
@@ -1534,31 +1699,6 @@ async def cleanup_scheduler():
 
 @cleanup_scheduler.before_loop
 async def before_cleanup():
-    await bot.wait_until_ready()
-
-@tasks.loop(hours=24)
-async def analytics_scheduler():
-    try:
-        if trades_col is None:
-            return
-
-        now_utc = datetime.utcnow()
-        start = datetime(now_utc.year, now_utc.month, now_utc.day) - timedelta(days=7)
-        trades = await fetch_all_trades({"created_at": {"$gte": start, "$lt": now_utc}})
-
-        if not trades:
-            logger.info("analytics_scheduler: no recent trades.")
-            return
-
-        ch = get_channel(ANALYTICS_CHANNEL_ID)
-        if ch is not None:
-            await ch.send(embed=make_analytics_embed(trades, title="📈 7-Day Pattern Analytics"))
-
-    except Exception:
-        logger.exception("ERROR in analytics_scheduler")
-
-@analytics_scheduler.before_loop
-async def before_analytics():
     await bot.wait_until_ready()
 
 # ============================================================
